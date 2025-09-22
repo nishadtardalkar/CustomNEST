@@ -190,7 +190,7 @@ class NEST2(tf.keras.Model):
         es = np.tile(np.arange(n_entities), (1)).reshape((-1, 1))
         xs = np.hstack([xs, es])
         probs = self.predict(xs)
-        probs = probs.reshape((1, n_entities)).numpy()[0]
+        probs = probs.reshape((1, n_entities))[0]
         print(probs.min(), probs.max())
         print(probs.argmin(), probs.argmax())
         print(probs.mean(), probs.std())
