@@ -144,7 +144,7 @@ class NEST2(tf.keras.Model):
         return {m.name: m.result() for m in self.metrics}
 
     def compute_mrr(self, x, n_entities):
-        samples = 165
+        samples = 50
         xs = x[:samples, :-1]
         ys = x[:samples, -1]
         """
@@ -168,6 +168,32 @@ class NEST2(tf.keras.Model):
         ranks = np.where(args == ys[:, None])[1] + 1
         mrr = np.mean(1.0 / ranks)
         return mrr
+
+    def compute_hit10(self, x, n_entities):
+        samples = 50
+        xs = x[:samples, :-1]
+        ys = x[:samples, -1]
+        xs = np.tile(xs, (1, n_entities)).reshape((-1, 3))
+        es = np.tile(np.arange(n_entities), (samples)).reshape((-1, 1))
+        xs = np.hstack([xs, es])
+        probs = self.predict(xs)
+        probs = probs.reshape((samples, n_entities))
+        args = np.argsort(probs, axis=1)
+        ranks = np.where(args == ys[:, None])[1] + 1
+        hit10 = np.mean(ranks <= 10)
+        return hit10
+
+    def sample_prediction(self, x, n_entities):
+        xs = x[:1, :-1]
+        ys = x[:1, -1]
+        xs = np.tile(xs, (1, n_entities)).reshape((-1, 3))
+        es = np.tile(np.arange(n_entities), (1)).reshape((-1, 1))
+        xs = np.hstack([xs, es])
+        probs = self.predict(xs)
+        probs = probs.reshape((1, n_entities)).numpy()[0]
+        print(probs.min(), probs.max())
+        print(probs.argmin(), probs.argmax())
+        print(probs.mean(), probs.std())
 
 
 class LoadData:
@@ -248,4 +274,6 @@ while True:
         batch_size=16,
     )
     print(model.compute_mrr(data.test_data_x, data.nvec[1]))
+    print(model.compute_hit10(data.test_data_x, data.nvec[1]))
+    model.sample_prediction(data.test_data_x, data.nvec[1])
     model.save("model.h5")
