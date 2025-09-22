@@ -144,10 +144,12 @@ class NEST2(tf.keras.Model):
         return {m.name: m.result() for m in self.metrics}
 
     def compute_mrr(self, x, n_entities):
-        xs = x[:, :-1]
-        ys = x[:, -1]
-        mrr = np.zeros(x.shape[0])
-        for i in range(x.shape[0]):
+        samples = 165
+        xs = x[:samples, :-1]
+        ys = x[:samples, -1]
+        """
+        mrr = np.zeros(samples)
+        for i in range(samples):
             p = np.tile(xs[i], (n_entities, 1))
             p = np.hstack([p, np.arange(n_entities).reshape((-1, 1))])
             probs = self(p)
@@ -158,14 +160,13 @@ class NEST2(tf.keras.Model):
         mrr = np.mean(1.0 / mrr)
         """
         xs = np.tile(xs, (1, n_entities)).reshape((-1, 3))
-        es = np.tile(np.arange(n_entities), (x.shape[0])).reshape((-1, 1))
+        es = np.tile(np.arange(n_entities), (samples)).reshape((-1, 1))
         xs = np.hstack([xs, es])
         probs = self.predict(xs)
-        probs = probs.reshape((x.shape[0], n_entities))
+        probs = probs.reshape((samples, n_entities))
         args = np.argsort(probs, axis=1)
         ranks = np.where(args == ys[:, None])[1] + 1
         mrr = np.mean(1.0 / ranks)
-        """
         return mrr
 
 
@@ -230,18 +231,21 @@ class LoadData:
         )
 
 
-data = LoadData("data/WikiPeople-3", negative_ratio=10)
+data = LoadData("data/WikiPeople-3", negative_ratio=2)
 model = NEST2(nmod=4, nvec=data.nvec, R=10, m=100)
 model.compile(optimizer=tf.keras.optimizers.Adam(1e-3))
 
-print(model.compute_mrr(data.train_data_x, data.nvec[1]))
-"""
-model.fit(
-    data.train_data_x,
-    data.train_data_y,
-    epochs=1,
-    batch_size=16,
-)
+try:
+    model = tf.keras.models.load_model("model.h5")
+except:
+    pass
 
-print(model.compute_mrr(data.test_data_x, data.nvec[1]))
-"""
+while True:
+    model.fit(
+        data.train_data_x,
+        data.train_data_y,
+        epochs=10,
+        batch_size=16,
+    )
+    print(model.compute_mrr(data.test_data_x, data.nvec[1]))
+    model.save("model.h5")
