@@ -1,0 +1,368 @@
+NEST2 Model Data Flow Analysis
+================================
+
+This document details the complete data flow through the NEST2 model, from input to output,
+including all functions and transformations used at each stage.
+
+1. MODEL INITIALIZATION (__init__)
+==================================
+
+Input Parameters:
+- ind: numpy array (N, 4) - training indices in format (r, e1, e2, e3)
+- nvec: list [nr, ne1, ne2, ne3] - number of entities per mode
+- R: int - embedding rank/dimension
+- y: numpy array (N,) - target values (if any)
+- m: int - number of random Fourier frequencies
+- B: int - batch size
+- lr: float - learning rate
+- ce_target_slot: int - which slot to predict (default: 0 for relation)
+- K: int - number of negative candidates (default: 2048)
+
+1.1 Data Preprocessing:
+-----------------------
+- self.ind = ind.astype(np.int32)  # Convert indices to int32
+- self.y = y.reshape([y.size, 1])  # Reshape targets to column vector
+- self.nmod = len(nvec)  # Number of modes (4 for (r,e1,e2,e3))
+- self.ce_target_slot = int(ce_target_slot)  # Target slot for prediction
+
+1.2 Sociability Parameters (Beta-Stick Breaking):
+-------------------------------------------------
+For each mode k ∈ {0,1,2,3}:
+- self.tf_v_hat[k] = tf.Variable(scipy.special.logit(np.random.rand(nvec[k], R)))
+  * Shape: (nvec[k], R)
+  * Purpose: Raw logit parameters for stick-breaking weights
+
+1.3 Stick-Breaking Transformation:
+---------------------------------
+log_v[k] = tf.math.log_sigmoid(self.tf_v_hat[k])
+log_v_minus[k] = tf.math.log_sigmoid(-self.tf_v_hat[k])
+cum_sum[k] = tf.cumsum(log_v_minus[k], exclusive=True, axis=1)
+log_omega[k] = log_v[k] + cum_sum[k]
+
+Purpose: Converts logit parameters to proper stick-breaking weights
+Output: log_omega[k] shape (nvec[k], R) with sum ≤ 1 along axis 1
+
+1.4 Embedding Generation:
+-------------------------
+u[k] = tf.exp(log_omega[k])  # Convert to positive weights
+
+# Row-wise standardization for numerical stability
+self.tf_U[k] = (u[k] - tf.reduce_mean(u[k], axis=1, keepdims=True)) / 
+               (tf.math.reduce_std(u[k], axis=1, keepdims=True) + 1e-6)
+
+Purpose: Creates standardized embeddings for each mode
+Output: self.tf_U[k] shape (nvec[k], R)
+
+1.5 Random Fourier Features Setup:
+---------------------------------
+self.d = self.nmod * self.R  # Total feature dimension (4*R)
+self.tf_S = tf.Variable(np.random.randn(m, self.d) / (2*np.pi))
+self.b = tf.Variable(np.random.uniform(0, 2*np.pi, size=(1, m)))
+
+Purpose: Random Fourier frequencies and phase shifts
+- self.tf_S: shape (m, 4*R) - frequency matrix
+- self.b: shape (1, m) - phase shifts
+
+1.6 Weight Parameters:
+----------------------
+self.w_mu = tf.Variable(np.random.rand(2*m, 1))  # Mean weights
+self.w_L = tf.Variable(1.0/m * np.eye(2*m))     # Cholesky factor
+w_Ltril = tf.matrix_band_part(self.w_L, -1, 0)  # Lower triangular part
+
+Purpose: Gaussian process weights for RFF
+- w_mu: shape (2*m, 1) - mean of weight distribution
+- w_L: shape (2*m, 2*m) - Cholesky decomposition of covariance
+
+1.7 Placeholders:
+-----------------
+self.tf_sub = tf.placeholder(tf.int32, shape=[None, 4])  # General queries
+self.tf_pos = tf.placeholder(tf.int32, shape=[None, 4])  # Positive examples
+self.tf_cand_ids = tf.placeholder(tf.int32, shape=[None, K+1])  # Candidate IDs
+self.tf_y = tf.placeholder(tf.float32, shape=[None, 1])  # Target values
+
+2. FEATURE EXTRACTION PIPELINE
+==============================
+
+2.1 General Feature Extraction (for plausibility scoring):
+----------------------------------------------------------
+Input: self.tf_sub shape (B, 4) - batch of (r,e1,e2,e3) queries
+
+Step 1: Gather embeddings for each mode
+sub_inputs = tf.concat([
+    tf.gather(self.tf_U[0], self.tf_sub[:, 0]),  # Relation embeddings
+    tf.gather(self.tf_U[1], self.tf_sub[:, 1]),  # Entity1 embeddings
+    tf.gather(self.tf_U[2], self.tf_sub[:, 2]),  # Entity2 embeddings
+    tf.gather(self.tf_U[3], self.tf_sub[:, 3])   # Entity3 embeddings
+], 1)
+
+Output: sub_inputs shape (B, 4*R)
+
+Step 2: Random Fourier Feature transformation
+sub_phi_lin = tf.matmul(sub_inputs, tf.transpose(self.tf_S)) + self.b
+sub_phi = tf.concat([tf.cos(sub_phi_lin), tf.sin(sub_phi_lin)], 1)
+
+Output: sub_phi shape (B, 2*m)
+
+Step 3: Linear combination with weights
+self.score_logits_node = tf.matmul(sub_phi, self.w_mu)
+
+Output: self.score_logits_node shape (B, 1)
+
+2.2 Candidate Generation for Cross-Entropy Loss:
+------------------------------------------------
+Input: self.tf_pos shape (B, 4) - positive examples
+Input: self.tf_cand_ids shape (B, K+1) - candidate IDs (true + K negatives)
+
+Step 1: Create candidate tuples
+pos_cols = [self.tf_pos[:, k] for k in range(4)]
+tiles = []
+for k in range(4):
+    if k == self.ce_target_slot:
+        tiles.append(self.tf_cand_ids)  # Use candidate IDs for target slot
+    else:
+        tiles.append(tf.tile(tf.expand_dims(pos_cols[k], 1), [1, K+1]))
+
+cand = tf.stack(tiles, axis=2)  # Shape (B, K+1, 4)
+cand_flat = tf.reshape(cand, [-1, 4])  # Shape (B*(K+1), 4)
+
+Step 2: Extract features for all candidates
+feats = [tf.gather(self.tf_U[k], cand_flat[:, k]) for k in range(4)]
+tf_inputs_all = tf.concat(feats, axis=1)  # Shape (B*(K+1), 4*R)
+
+Step 3: Apply RFF transformation
+Phi_lin_all = tf.matmul(tf_inputs_all, tf.transpose(self.tf_S)) + self.b
+Phi_all = tf.concat([tf.cos(Phi_lin_all), tf.sin(Phi_lin_all)], axis=1)
+
+Step 4: Compute logits
+logits_flat = tf.matmul(Phi_all, self.w_mu)  # Shape (B*(K+1), 1)
+logits_all = tf.reshape(logits_flat, [B_dyn, K+1])  # Shape (B, K+1)
+
+3. LOSS FUNCTIONS
+=================
+
+3.1 Cross-Entropy Loss (Primary):
+---------------------------------
+labels = tf.zeros([B_dyn], dtype=tf.int32)  # True candidate is always at index 0
+
+# L2 regularization on weights
+ce_reg = 1e-6 * (tf.nn.l2_loss(self.w_mu) + tf.nn.l2_loss(self.tf_S))
+
+self.loss_ce = tf.reduce_mean(
+    tf.nn.sparse_softmax_cross_entropy_with_logits(labels=labels, logits=logits_all)
+) + ce_reg
+
+Purpose: Train model to rank true candidates higher than negatives
+
+3.2 ELBO Loss (Optional):
+-------------------------
+if self.use_elbo == True:
+    ELBO = -2*(np.pi**2)*tf.reduce_sum(self.tf_S*self.tf_S) \
+        - 0.5*self.m * (tf.trace(tf.matmul(self.w_mu, tf.transpose(self.w_mu))) \
+        + tf.matmul(w_Ltril, tf.transpose(w_Ltril))) \
+        + 0.5 * tf.reduce_sum(tf.log(tf.pow(tf.diag_part(w_Ltril), 2))) \
+        + (self.alpha - 1.0) * tf.math.add_n([tf.reduce_sum(log_v_minus[k]) for k in range(4)]) \
+        + 0.5 * self.N * self.tf_log_tau \
+        - 0.5 * tau * self.N / self.B * (tf.reduce_sum(tf.pow(self.tf_y - tf.matmul(sub_phi, self.w_mu), 2)) \
+        + tf.reduce_sum(tf.pow(tf.matmul(sub_phi, w_Ltril), 2))) \
+        + self.N / self.B * tf.reduce_sum(log_edge_prob)
+    
+    self.loss = -ELBO
+
+Purpose: Bayesian inference with variational approximation
+
+4. OPTIMIZATION
+===============
+
+4.1 Learning Rate Scheduling:
+-----------------------------
+self.global_step = tf.Variable(0, trainable=False)
+decay_steps = 20000
+decay_rate = 0.8
+self.lr_node = tf.train.exponential_decay(
+    self.learning_rate, self.global_step, decay_steps, decay_rate, staircase=True
+)
+
+4.2 Optimizer:
+--------------
+self.train_ce = tf.train.AdamOptimizer(self.lr_node).minimize(
+    self.loss_ce, global_step=self.global_step
+)
+
+5. TRAINING LOOP
+================
+
+5.1 Data Preparation:
+---------------------
+n = int(self.N)  # Total number of training examples
+steps_per_epoch = max(1, int(math.ceil(n / self.B)))
+perm = np.random.permutation(n)  # Shuffle training data
+
+5.2 Batch Processing:
+---------------------
+for each epoch:
+    for each batch:
+        # Extract batch indices
+        batch_ids = perm[curr:curr+take]
+        pos_batch = self.ind[batch_ids, :].astype(np.int32)  # Shape (B, 4)
+        
+        # Generate negative candidates
+        cand_ids_batch = build_cand_ids_batch_mined(
+            model=self,
+            pos_batch=pos_batch,
+            n_cand_total=self.nvec[self.ce_target_slot],
+            all_true=all_true,
+            K=self.K,
+            pool_size=8192,
+            mine_top=self.K
+        )  # Shape (B, K+1)
+        
+        # Training step
+        _, loss_val = self.sess.run(
+            [self.train_ce, self.loss_ce],
+            feed_dict={
+                self.tf_pos: pos_batch,
+                self.tf_cand_ids: cand_ids_batch
+            }
+        )
+
+5.3 Negative Sampling (build_cand_ids_batch_mined):
+---------------------------------------------------
+For each positive example (r, e1, e2, e3):
+
+Step 1: Define forbidden candidates
+forbidden = set(all_true.get((r, e2, e3), ())) | {e1}
+
+Step 2: Sample candidate pool
+pool = []
+while len(pool) < pool_size:
+    c = np.random.randint(0, n_cand_total)
+    if c not in forbidden:
+        pool.append(c)
+
+Step 3: Score and mine hardest negatives
+base = np.array([[r, 0, e2, e3]], dtype=np.int32)
+cand_rows = np.tile(base, (pool.shape[0], 1))
+cand_rows[:, 1] = pool  # Set candidate in target slot
+scores = _score_rows_direct(model, cand_rows, chunk=8192)
+order = np.argsort(-scores)  # Sort by descending score
+pool = pool[order][:mine_top]  # Keep hardest candidates
+
+Step 4: Finalize candidates
+negs = list(pool[:K])
+# Ensure unique negatives and fill remaining if needed
+while len(negs) < K:
+    c = np.random.randint(0, n_cand_total)
+    if c not in forbidden and c not in seen:
+        negs.append(c)
+
+Output: (B, K+1) array with true candidate at index 0
+
+6. INFERENCE METHODS
+====================
+
+6.1 Plausibility Scoring (plausibility_with_logits):
+----------------------------------------------------
+Input: quads_e1_first shape (Q, 4) - queries in (r,e1,e2,e3) format
+
+Step 1: Get logits from model
+logits = self.sess.run(self.score_logits_node, 
+                      feed_dict={self.tf_sub: quads_e1_first})
+
+Step 2: Convert to probabilities
+probs = 1.0 / (1.0 + np.exp(-logits.reshape(-1)))
+
+Output: probs shape (Q,) - plausibility scores in [0,1]
+
+6.2 Ranking (rank_slot_chunked):
+--------------------------------
+Input: batch_rows shape (Q, 4) - queries
+Input: slot - which slot to rank (default: self.ce_target_slot)
+Input: chunk_cand - chunk size for memory efficiency
+
+Step 1: Prepare base queries
+base = batch_rows.copy()
+base[:, slot] = 0  # Will be filled with candidate IDs
+
+Step 2: Score all candidates in chunks
+for start in range(0, n_cand, chunk_cand):
+    end = min(start + chunk_cand, n_cand)
+    cand = np.tile(base[:, None, :], (1, end - start, 1))
+    cand[:, :, slot] = np.arange(start, end, dtype=np.int32)[None, :]
+    
+    logits = self.sess.run(self.score_logits_node,
+                          feed_dict={self.tf_sub: cand.reshape(-1, 4)})
+    out[:, start:end] = logits.reshape(Q, end - start)
+
+Output: out shape (Q, n_cand) - raw logits for all candidates
+
+7. VALIDATION
+=============
+
+7.1 Hit@10 Evaluation:
+----------------------
+For validation set V with shape (N_val, 4):
+
+Step 1: Batch process validation queries
+for v0 in range(0, V.shape[0], val_q_batch):
+    vb = V[v0:v0 + val_q_batch].astype(np.int32)
+    
+    # Get scores for all candidates
+    logits = self.rank_slot_chunked(vb, slot=self.ce_target_slot)
+
+Step 2: Compute filtered Hit@10
+for each query (r, e1_true, e2, e3):
+    scores = logits[i].copy()
+    
+    # Filter out other true candidates
+    for e1_other in all_true_val.get((r, e2, e3), []):
+        if e1_other != e1_true:
+            scores[e1_other] = -np.inf
+    
+    # Check if true candidate is in top 10
+    top10 = np.argsort(-scores)[:10]
+    hits10 += int(e1_true in top10)
+
+Output: Hit@10 = hits10 / total_queries
+
+8. COMPLETE DATA FLOW SUMMARY
+=============================
+
+Input: Training triples (r, e1, e2, e3) with indices ∈ [0, nvec[k])
+       ↓
+1. Embedding Lookup: Gather embeddings from self.tf_U[k] for each mode
+       ↓
+2. Concatenation: Concatenate all mode embeddings → (B, 4*R)
+       ↓
+3. Random Fourier Features: 
+   - Linear transformation: matmul(embeddings, S^T) + b
+   - Trigonometric features: [cos(...), sin(...)] → (B, 2*m)
+       ↓
+4. Linear Combination: matmul(phi_features, w_mu) → (B, 1)
+       ↓
+5. Loss Computation:
+   - Cross-entropy: sparse_softmax_cross_entropy_with_logits
+   - Regularization: L2 on w_mu and S
+       ↓
+6. Optimization: Adam optimizer with exponential decay
+       ↓
+7. Inference: Same pipeline but for new queries
+   - Plausibility: sigmoid(logits) → [0,1] probabilities
+   - Ranking: score all candidates → rank by logits
+
+Key Functions Used:
+- tf.gather(): Embedding lookup
+- tf.concat(): Feature concatenation
+- tf.matmul(): Linear transformations
+- tf.cos()/tf.sin(): Trigonometric features
+- tf.nn.sparse_softmax_cross_entropy_with_logits(): Loss computation
+- tf.train.AdamOptimizer(): Optimization
+- build_cand_ids_batch_mined(): Negative sampling
+- _score_rows_direct(): Fast candidate scoring
+- rank_slot_chunked(): Candidate ranking
+- plausibility_with_logits(): Plausibility scoring
+
+Memory Considerations:
+- Batch size B affects memory usage
+- Chunk size for ranking (default 2048) balances memory vs speed
+- Pool size for negative sampling (default 8192) affects quality vs speed
+- K negative candidates per positive example (default 2048)
