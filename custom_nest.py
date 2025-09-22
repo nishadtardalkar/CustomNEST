@@ -191,6 +191,7 @@ class NEST2(tf.keras.Model):
         xs = np.hstack([xs, es])
         probs = self.predict(xs)
         probs = probs.reshape((1, n_entities))[0]
+        print(ys, probs[ys[0]])
         print(probs.min(), probs.max())
         print(probs.argmin(), probs.argmax())
         print(probs.mean(), probs.std())
@@ -273,7 +274,7 @@ while True:
         epochs=10,
         batch_size=16,
     )
-    print(model.compute_mrr(data.test_data_x, data.nvec[1]))
-    print(model.compute_hit10(data.test_data_x, data.nvec[1]))
+    # print(model.compute_mrr(data.test_data_x, data.nvec[1]))
+    # print(model.compute_hit10(data.test_data_x, data.nvec[1]))
     model.sample_prediction(data.test_data_x, data.nvec[1])
     model.save("model.h5")
